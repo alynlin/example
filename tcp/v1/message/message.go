@@ -9,8 +9,9 @@ type Message struct {
 }
 
 const (
-	MessageTypeRequest   = 0x01
-	MessageTypeResponse  = 0x02
-	MessageTypeHeartbeat = 0x03
-	HeaderSize           = 13 // 4+8+1
+	MessageTypeRequest  = 0x01
+	MessageTypeResponse = 0x02
+	// todo  是否改为 ping/pong 类型？
+	MessageTypeHeartbeat = 0x03 // 心跳包类型
+	HeaderSize           = 13   // 4+8+1
 )

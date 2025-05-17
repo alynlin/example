@@ -3,7 +3,9 @@ package connect
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -12,13 +14,6 @@ import (
 	"github.com/alynlin/example/tcp/v1/sequence"
 )
 
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		// Allocate a large enough buffer for most requests
-		return make([]byte, 4096)
-	},
-}
-
 type Connection struct {
 	conn            net.Conn
 	mu              sync.Mutex
@@ -26,6 +21,17 @@ type Connection struct {
 	closeCh         chan struct{}
 	writerCh        chan *v1.Message
 	closed          bool
+
+	readBuf  []byte
+	writeBuf []byte
+
+	maxBufSize int    // 最大缓冲区大小，header + body
+	addr       string // "host:port"
+	onLimit    BufferLimitCallback
+
+	//
+	lastReadTime time.Time     // 最后一次成功接收消息的时间
+	readTimeout  time.Duration // 最大允许的空闲时间
 }
 
 func (c *Connection) IsClosed() bool {
@@ -86,20 +92,35 @@ func (c *Connection) readLoop() {
 		case <-c.closeCh:
 			return
 		default:
-			header := bufPool.Get().([]byte)[:v1.HeaderSize]
+			// 保证 readBuf 至少能容纳 Header
+			if len(c.readBuf) < v1.HeaderSize {
+				c.readBuf = make([]byte, v1.HeaderSize)
+			}
+			header := c.readBuf[:v1.HeaderSize]
+
 			if _, err := io.ReadFull(c.conn, header); err != nil {
-				bufPool.Put(header)
 				return
 			}
 
 			length := binary.BigEndian.Uint32(header[:4])
 			reqID := binary.BigEndian.Uint64(header[4:12])
 			msgType := header[12]
-			bufPool.Put(header)
+			// 检查消息长度是否超出限制
+			if length < 0 || length > uint32(c.maxBufSize) {
+				if c.onLimit != nil {
+					c.onLimit(c.addr, "read", int(length))
+				}
+				return
+			}
 
-			body := bufPool.Get().([]byte)[:length-v1.HeaderSize]
+			// 确保缓冲区容量足够
+			bodyLen := int(length) - v1.HeaderSize
+			if cap(c.readBuf) < v1.HeaderSize+bodyLen {
+				c.readBuf = make([]byte, v1.HeaderSize+bodyLen)
+			}
+			body := c.readBuf[v1.HeaderSize : v1.HeaderSize+bodyLen]
+
 			if _, err := io.ReadFull(c.conn, body); err != nil {
-				bufPool.Put(body)
 				return
 			}
 
@@ -107,7 +128,7 @@ func (c *Connection) readLoop() {
 				Length:    length,
 				RequestID: reqID,
 				Type:      msgType,
-				Body:      body,
+				Body:      append([]byte{}, body...), // 深拷贝避免后续覆盖
 			}
 
 			switch msgType {
@@ -122,10 +143,15 @@ func (c *Connection) readLoop() {
 					delete(c.pendingRequests, reqID)
 				}
 				c.mu.Unlock()
+
 			case v1.MessageTypeHeartbeat:
-				// optional: handle heartbeat
+				// 可选 log: log.Printf("recv heartbeat from %s", c.addr)
+				// ✅ 更新最后读取时间 or  任何合法包都更新
+				log.Printf("recv heartbeat from %s", c.addr)
+				c.updateLastReadTime()
+
 			default:
-				// unknown message type
+				// 忽略未知包，或关闭连接
 			}
 		}
 	}
@@ -137,12 +163,17 @@ func (c *Connection) writeLoop() {
 	for {
 		select {
 		case msg := <-c.writerCh:
-			buf := bufPool.Get().([]byte)
 			size := v1.HeaderSize + len(msg.Body)
-			if cap(buf) < size {
-				buf = make([]byte, size)
+			if size > c.maxBufSize {
+				if c.onLimit != nil {
+					c.onLimit(c.addr, "write", size)
+				}
+				continue
 			}
-			buf = buf[:size]
+			if cap(c.writeBuf) < size {
+				c.writeBuf = make([]byte, size)
+			}
+			buf := c.writeBuf[:size]
 
 			binary.BigEndian.PutUint32(buf[:4], msg.Length)
 			binary.BigEndian.PutUint64(buf[4:12], msg.RequestID)
@@ -150,10 +181,8 @@ func (c *Connection) writeLoop() {
 			copy(buf[v1.HeaderSize:], msg.Body)
 
 			if _, err := c.conn.Write(buf); err != nil {
-				bufPool.Put(buf)
 				return
 			}
-			bufPool.Put(buf)
 		case <-c.closeCh:
 			return
 		}
@@ -201,4 +230,30 @@ func (c *Connection) startHeartbeat(interval time.Duration) {
 			return
 		}
 	}
+}
+
+func (c *Connection) startReadTimeoutWatcher(timeout time.Duration) {
+	ticker := time.NewTicker(timeout / 2) // 比timeout更频繁地检查
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			idle := time.Since(c.lastReadTime)
+
+			if idle > timeout {
+				// 长时间未收到任何消息，主动关闭连接
+				fmt.Printf("Connection %s idle for too long, closing", c.addr)
+				c.Close()
+				return
+			}
+		case <-c.closeCh:
+			return
+		}
+	}
+}
+
+func (c *Connection) updateLastReadTime() {
+	// 如果你希望更严谨可加锁或使用 atomic.Value，但业务上直接赋值是可以接受的
+	c.lastReadTime = time.Now()
 }

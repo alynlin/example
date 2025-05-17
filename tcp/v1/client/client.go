@@ -2,6 +2,7 @@ package v1
 
 import (
 	"encoding/json"
+	"log"
 	"time"
 
 	"github.com/alynlin/example/tcp/v1/connect"
@@ -12,8 +13,11 @@ type RPCClient struct {
 }
 
 func NewRPCClient() *RPCClient {
+	logCallback := func(addr, direction string, size int) {
+		log.Printf("[WARN] Buffer limit exceeded: addr=%s direction=%s size=%d", addr, direction, size)
+	}
 	return &RPCClient{
-		pool: connect.NewConnectionPool(5 * time.Second),
+		pool: connect.NewConnectionPool(5*time.Second, 64*1024, logCallback),
 	}
 }
 
