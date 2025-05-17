@@ -12,10 +12,17 @@ import (
 	"github.com/alynlin/example/tcp/v1/sequence"
 )
 
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		// Allocate a large enough buffer for most requests
+		return make([]byte, 4096)
+	},
+}
+
 type Connection struct {
 	conn            net.Conn
 	mu              sync.Mutex
-	pendingRequests map[uint64]chan *v1.Message // 请求ID到响应channel的映射
+	pendingRequests map[uint64]chan *v1.Message
 	closeCh         chan struct{}
 	writerCh        chan *v1.Message
 	closed          bool
@@ -39,7 +46,6 @@ func (c *Connection) SendRequest(body []byte, timeout time.Duration) ([]byte, er
 	c.pendingRequests[reqID] = respCh
 	c.mu.Unlock()
 
-	// 发送请求
 	msg := &v1.Message{
 		RequestID: reqID,
 		Type:      v1.MessageTypeRequest,
@@ -56,9 +62,11 @@ func (c *Connection) SendRequest(body []byte, timeout time.Duration) ([]byte, er
 		return nil, errors.New("send timeout")
 	}
 
-	// 等待响应
 	select {
-	case resp := <-respCh:
+	case resp, ok := <-respCh:
+		if !ok {
+			return nil, errors.New("response channel closed")
+		}
 		return resp.Body, nil
 	case <-time.After(timeout):
 		c.mu.Lock()
@@ -78,19 +86,20 @@ func (c *Connection) readLoop() {
 		case <-c.closeCh:
 			return
 		default:
-			// 读取消息头
-			header := make([]byte, v1.HeaderSize)
+			header := bufPool.Get().([]byte)[:v1.HeaderSize]
 			if _, err := io.ReadFull(c.conn, header); err != nil {
+				bufPool.Put(header)
 				return
 			}
 
 			length := binary.BigEndian.Uint32(header[:4])
 			reqID := binary.BigEndian.Uint64(header[4:12])
 			msgType := header[12]
+			bufPool.Put(header)
 
-			// 读取消息体
-			body := make([]byte, length-v1.HeaderSize)
+			body := bufPool.Get().([]byte)[:length-v1.HeaderSize]
 			if _, err := io.ReadFull(c.conn, body); err != nil {
+				bufPool.Put(body)
 				return
 			}
 
@@ -104,13 +113,19 @@ func (c *Connection) readLoop() {
 			switch msgType {
 			case v1.MessageTypeResponse:
 				c.mu.Lock()
-				if ch, ok := c.pendingRequests[reqID]; ok {
-					ch <- msg
+				ch, ok := c.pendingRequests[reqID]
+				if ok {
+					select {
+					case ch <- msg:
+					default:
+					}
 					delete(c.pendingRequests, reqID)
 				}
 				c.mu.Unlock()
 			case v1.MessageTypeHeartbeat:
-				// 处理心跳
+				// optional: handle heartbeat
+			default:
+				// unknown message type
 			}
 		}
 	}
@@ -122,15 +137,23 @@ func (c *Connection) writeLoop() {
 	for {
 		select {
 		case msg := <-c.writerCh:
-			buf := make([]byte, v1.HeaderSize+len(msg.Body))
+			buf := bufPool.Get().([]byte)
+			size := v1.HeaderSize + len(msg.Body)
+			if cap(buf) < size {
+				buf = make([]byte, size)
+			}
+			buf = buf[:size]
+
 			binary.BigEndian.PutUint32(buf[:4], msg.Length)
 			binary.BigEndian.PutUint64(buf[4:12], msg.RequestID)
 			buf[12] = msg.Type
 			copy(buf[v1.HeaderSize:], msg.Body)
 
 			if _, err := c.conn.Write(buf); err != nil {
+				bufPool.Put(buf)
 				return
 			}
+			bufPool.Put(buf)
 		case <-c.closeCh:
 			return
 		}
@@ -147,83 +170,10 @@ func (c *Connection) Close() {
 
 	c.closed = true
 	close(c.closeCh)
-	c.conn.Close()
+	_ = c.conn.Close()
 
-	// 通知所有等待的请求
 	for reqID, ch := range c.pendingRequests {
 		close(ch)
-		delete(c.pendingRequests, reqID)
-	}
-}
-
-func (c *Connection) SendBatch(requests [][]byte, timeout time.Duration) ([][]byte, error) {
-	batchID := sequence.GenerateRequestID()
-	respCh := make(chan *v1.Message, len(requests))
-	results := make([][]byte, len(requests))
-
-	// 注册所有请求
-	c.mu.Lock()
-	for i := range requests {
-		reqID := batchID + uint64(i)
-		c.pendingRequests[reqID] = respCh
-	}
-	c.mu.Unlock()
-
-	// 确保在退出时清理资源
-	defer c.cleanupBatch(batchID, uint64(len(requests)))
-
-	// 发送所有请求
-	for i, body := range requests {
-		msg := &v1.Message{
-			RequestID: batchID + uint64(i),
-			Type:      v1.MessageTypeRequest,
-			Body:      body,
-		}
-		msg.Length = uint32(v1.HeaderSize + len(msg.Body))
-
-		select {
-		case c.writerCh <- msg:
-		case <-time.After(timeout):
-			return nil, errors.New("send timeout")
-		}
-	}
-
-	// 收集响应
-	deadline := time.Now().Add(timeout)
-	for i := 0; i < len(requests); i++ {
-		select {
-		case resp := <-respCh:
-			idx := int(resp.RequestID - batchID)
-			if idx >= 0 && idx < len(results) {
-				results[idx] = resp.Body
-			}
-		case <-time.After(time.Until(deadline)):
-			return nil, errors.New("request timeout")
-		case <-c.closeCh:
-			return nil, errors.New("connection closed")
-		}
-	}
-
-	// 取消defer的清理，因为所有请求都已完成
-	c.mu.Lock()
-	for i := uint64(0); i < uint64(len(requests)); i++ {
-		delete(c.pendingRequests, batchID+i)
-	}
-	c.mu.Unlock()
-
-	return results, nil
-}
-
-func (c *Connection) cleanupBatch(batchID uint64, count uint64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for i := uint64(0); i < count; i++ {
-		reqID := batchID + i
-		if ch, ok := c.pendingRequests[reqID]; ok {
-			close(ch)
-		}
-		// Go 1.18+ 可以直接使用delete内置函数
 		delete(c.pendingRequests, reqID)
 	}
 }
@@ -236,7 +186,7 @@ func (c *Connection) startHeartbeat(interval time.Duration) {
 		select {
 		case <-ticker.C:
 			msg := &v1.Message{
-				RequestID: 0, // 心跳使用特殊ID
+				RequestID: 0,
 				Type:      v1.MessageTypeHeartbeat,
 				Body:      nil,
 			}
