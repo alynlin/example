@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	v1 "github.com/alynlin/example/tcp/v1/message"
+	"github.com/alynlin/example/tcp/v1/protocol"
 )
 
 const (
@@ -66,9 +66,9 @@ func (p *ConnectionPool) newConnection(addr string) (*Connection, error) {
 
 	c := &Connection{
 		conn:            conn,
-		pendingRequests: make(map[uint64]chan *v1.Message),
+		pendingRequests: make(map[uint64]*protocol.Future),
 		closeCh:         make(chan struct{}),
-		writerCh:        make(chan *v1.Message, 100),
+		writerCh:        make(chan *protocol.Message, 100),
 		readBuf:         make([]byte, 4096),
 		writeBuf:        make([]byte, 4096),
 		maxBufSize:      p.maxBufferSize,

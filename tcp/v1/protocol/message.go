@@ -1,4 +1,4 @@
-package message
+package protocol
 
 // 协议帧结构
 type Message struct {

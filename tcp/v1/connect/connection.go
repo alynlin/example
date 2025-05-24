@@ -10,16 +10,16 @@ import (
 	"sync"
 	"time"
 
-	v1 "github.com/alynlin/example/tcp/v1/message"
+	"github.com/alynlin/example/tcp/v1/protocol"
 	"github.com/alynlin/example/tcp/v1/sequence"
 )
 
 type Connection struct {
 	conn            net.Conn
 	mu              sync.Mutex
-	pendingRequests map[uint64]chan *v1.Message
+	pendingRequests map[uint64]*protocol.Future
 	closeCh         chan struct{}
-	writerCh        chan *v1.Message
+	writerCh        chan *protocol.Message
 	closed          bool
 
 	readBuf  []byte
@@ -42,22 +42,22 @@ func (c *Connection) IsClosed() bool {
 
 func (c *Connection) SendRequest(body []byte, timeout time.Duration) ([]byte, error) {
 	reqID := sequence.GenerateRequestID()
-	respCh := make(chan *v1.Message, 1)
+	future := protocol.NewFuture(timeout)
 
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return nil, errors.New("connection closed")
 	}
-	c.pendingRequests[reqID] = respCh
+	c.pendingRequests[reqID] = future
 	c.mu.Unlock()
 
-	msg := &v1.Message{
+	msg := &protocol.Message{
 		RequestID: reqID,
-		Type:      v1.MessageTypeRequest,
+		Type:      protocol.MessageTypeRequest,
 		Body:      body,
 	}
-	msg.Length = uint32(v1.HeaderSize + len(msg.Body))
+	msg.Length = uint32(protocol.HeaderSize + len(msg.Body))
 
 	select {
 	case c.writerCh <- msg:
@@ -66,22 +66,21 @@ func (c *Connection) SendRequest(body []byte, timeout time.Duration) ([]byte, er
 		delete(c.pendingRequests, reqID)
 		c.mu.Unlock()
 		return nil, errors.New("send timeout")
-	}
-
-	select {
-	case resp, ok := <-respCh:
-		if !ok {
-			return nil, errors.New("response channel closed")
-		}
-		return resp.Body, nil
-	case <-time.After(timeout):
-		c.mu.Lock()
-		delete(c.pendingRequests, reqID)
-		c.mu.Unlock()
-		return nil, errors.New("request timeout")
 	case <-c.closeCh:
 		return nil, errors.New("connection closed")
 	}
+
+	// 等待响应
+	resp, err := future.Await()
+
+	c.mu.Lock()
+	delete(c.pendingRequests, reqID)
+	c.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
 }
 
 func (c *Connection) readLoop() {
@@ -93,10 +92,10 @@ func (c *Connection) readLoop() {
 			return
 		default:
 			// 保证 readBuf 至少能容纳 Header
-			if len(c.readBuf) < v1.HeaderSize {
-				c.readBuf = make([]byte, v1.HeaderSize)
+			if len(c.readBuf) < protocol.HeaderSize {
+				c.readBuf = make([]byte, protocol.HeaderSize)
 			}
-			header := c.readBuf[:v1.HeaderSize]
+			header := c.readBuf[:protocol.HeaderSize]
 
 			if _, err := io.ReadFull(c.conn, header); err != nil {
 				return
@@ -114,17 +113,17 @@ func (c *Connection) readLoop() {
 			}
 
 			// 确保缓冲区容量足够
-			bodyLen := int(length) - v1.HeaderSize
-			if cap(c.readBuf) < v1.HeaderSize+bodyLen {
-				c.readBuf = make([]byte, v1.HeaderSize+bodyLen)
+			bodyLen := int(length) - protocol.HeaderSize
+			if cap(c.readBuf) < protocol.HeaderSize+bodyLen {
+				c.readBuf = make([]byte, protocol.HeaderSize+bodyLen)
 			}
-			body := c.readBuf[v1.HeaderSize : v1.HeaderSize+bodyLen]
+			body := c.readBuf[protocol.HeaderSize : protocol.HeaderSize+bodyLen]
 
 			if _, err := io.ReadFull(c.conn, body); err != nil {
 				return
 			}
 
-			msg := &v1.Message{
+			msg := &protocol.Message{
 				Length:    length,
 				RequestID: reqID,
 				Type:      msgType,
@@ -132,21 +131,11 @@ func (c *Connection) readLoop() {
 			}
 
 			switch msgType {
-			case v1.MessageTypeResponse:
-				c.mu.Lock()
-				ch, ok := c.pendingRequests[reqID]
-				if ok {
-					select {
-					case ch <- msg:
-					default:
-					}
-					delete(c.pendingRequests, reqID)
-				}
-				c.mu.Unlock()
-
-			case v1.MessageTypeHeartbeat:
+			case protocol.MessageTypeResponse:
+				c.completeRequest(reqID, msg)
+			case protocol.MessageTypeHeartbeat:
 				// 可选 log: log.Printf("recv heartbeat from %s", c.addr)
-				// ✅ 更新最后读取时间 or  任何合法包都更新
+				// 更新最后读取时间 or  任何合法包都更新
 				log.Printf("recv heartbeat from %s", c.addr)
 				c.updateLastReadTime()
 
@@ -163,7 +152,7 @@ func (c *Connection) writeLoop() {
 	for {
 		select {
 		case msg := <-c.writerCh:
-			size := v1.HeaderSize + len(msg.Body)
+			size := protocol.HeaderSize + len(msg.Body)
 			if size > c.maxBufSize {
 				if c.onLimit != nil {
 					c.onLimit(c.addr, "write", size)
@@ -178,7 +167,7 @@ func (c *Connection) writeLoop() {
 			binary.BigEndian.PutUint32(buf[:4], msg.Length)
 			binary.BigEndian.PutUint64(buf[4:12], msg.RequestID)
 			buf[12] = msg.Type
-			copy(buf[v1.HeaderSize:], msg.Body)
+			copy(buf[protocol.HeaderSize:], msg.Body)
 
 			if _, err := c.conn.Write(buf); err != nil {
 				return
@@ -186,6 +175,17 @@ func (c *Connection) writeLoop() {
 		case <-c.closeCh:
 			return
 		}
+	}
+}
+
+func (c *Connection) completeRequest(reqID uint64, msg *protocol.Message) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if future, ok := c.pendingRequests[reqID]; ok {
+		future.Done(msg)
+		delete(c.pendingRequests, reqID)
+		future = nil // 释放内存，避免内存泄漏
 	}
 }
 
@@ -201,8 +201,8 @@ func (c *Connection) Close() {
 	close(c.closeCh)
 	_ = c.conn.Close()
 
-	for reqID, ch := range c.pendingRequests {
-		close(ch)
+	for reqID, future := range c.pendingRequests {
+		future.Cancel()
 		delete(c.pendingRequests, reqID)
 	}
 }
@@ -214,12 +214,12 @@ func (c *Connection) startHeartbeat(interval time.Duration) {
 	for {
 		select {
 		case <-ticker.C:
-			msg := &v1.Message{
+			msg := &protocol.Message{
 				RequestID: 0,
-				Type:      v1.MessageTypeHeartbeat,
+				Type:      protocol.MessageTypeHeartbeat,
 				Body:      nil,
 			}
-			msg.Length = uint32(v1.HeaderSize)
+			msg.Length = uint32(protocol.HeaderSize)
 
 			select {
 			case c.writerCh <- msg:

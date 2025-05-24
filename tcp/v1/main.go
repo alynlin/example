@@ -42,7 +42,22 @@ func main() {
 
 	fmt.Println(sequence.GenerateRequestID_danji())
 	client := v1.NewRPCClient()
-
+	channel := make(chan struct{}, 100)
+	for i := 0; i < 10000; i++ {
+		channel <- struct{}{}
+		go func(ch chan struct{}) {
+			// 发送请求
+			rsp, err := client.Call("localhost:8080", "add", []int{1, 2, 3}, 5*time.Second)
+			if err != nil {
+				fmt.Println("call failed:", err)
+			} else {
+				fmt.Println("call success:", string(rsp))
+			}
+			<-ch
+			log.Printf("done:%v", i)
+		}(channel)
+	}
+	// 发送请求
 	rsp, err := client.Call("localhost:8080", "add", []int{1, 2, 3}, 5*time.Second)
 
 	if err != nil {

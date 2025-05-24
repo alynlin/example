@@ -8,7 +8,7 @@ import (
 	"log"
 	"net"
 
-	v1 "github.com/alynlin/example/tcp/v1/message"
+	"github.com/alynlin/example/tcp/v1/protocol"
 )
 
 type RPCServer struct {
@@ -57,7 +57,7 @@ func (s *RPCServer) handleConn(conn net.Conn) {
 
 	for {
 		// 读取消息头
-		header := make([]byte, v1.HeaderSize)
+		header := make([]byte, protocol.HeaderSize)
 		if _, err := io.ReadFull(conn, header); err != nil {
 			return
 		}
@@ -67,10 +67,10 @@ func (s *RPCServer) handleConn(conn net.Conn) {
 		msgType := header[12]
 
 		switch msgType {
-		case v1.MessageTypeRequest:
+		case protocol.MessageTypeRequest:
 			s.handleRequest(conn, reqID, length)
 			continue
-		case v1.MessageTypeHeartbeat:
+		case protocol.MessageTypeHeartbeat:
 			// 可选 log: log.Printf("recv heartbeat from %s", c.addr)
 			log.Printf("server recv heartbeat from %s", conn.RemoteAddr())
 			s.handleHeartbeat(conn)
@@ -81,24 +81,24 @@ func (s *RPCServer) handleConn(conn net.Conn) {
 }
 
 func (s *RPCServer) handleHeartbeat(conn net.Conn) {
-	msg := &v1.Message{
+	msg := &protocol.Message{
 		RequestID: 0,
-		Type:      v1.MessageTypeHeartbeat,
+		Type:      protocol.MessageTypeHeartbeat,
 		Body:      nil,
 	}
-	msg.Length = uint32(v1.HeaderSize)
+	msg.Length = uint32(protocol.HeaderSize)
 
 	buf := make([]byte, msg.Length)
 	binary.BigEndian.PutUint32(buf[:4], msg.Length)
 	binary.BigEndian.PutUint64(buf[4:12], msg.RequestID)
 	buf[12] = msg.Type
-	copy(buf[v1.HeaderSize:], msg.Body)
+	copy(buf[protocol.HeaderSize:], msg.Body)
 	_, _ = conn.Write(buf)
 }
 func (s *RPCServer) handleRequest(conn net.Conn, reqID uint64, length uint32) {
 
 	// 读取消息体
-	body := make([]byte, length-v1.HeaderSize)
+	body := make([]byte, length-protocol.HeaderSize)
 	if _, err := io.ReadFull(conn, body); err != nil {
 		return
 	}
@@ -122,18 +122,18 @@ func (s *RPCServer) handleRequest(conn net.Conn, reqID uint64, length uint32) {
 	}
 
 	// 发送响应
-	resp := &v1.Message{
-		Length:    uint32(v1.HeaderSize + len(result)),
+	resp := &protocol.Message{
+		Length:    uint32(protocol.HeaderSize + len(result)),
 		RequestID: reqID,
-		Type:      v1.MessageTypeResponse,
+		Type:      protocol.MessageTypeResponse,
 		Body:      result,
 	}
 
-	buf := make([]byte, v1.HeaderSize+len(resp.Body))
+	buf := make([]byte, protocol.HeaderSize+len(resp.Body))
 	binary.BigEndian.PutUint32(buf[:4], resp.Length)
 	binary.BigEndian.PutUint64(buf[4:12], resp.RequestID)
 	buf[12] = resp.Type
-	copy(buf[v1.HeaderSize:], resp.Body)
+	copy(buf[protocol.HeaderSize:], resp.Body)
 
 	if _, err := conn.Write(buf); err != nil {
 		return
@@ -141,16 +141,16 @@ func (s *RPCServer) handleRequest(conn net.Conn, reqID uint64, length uint32) {
 }
 
 func (s *RPCServer) writeError(conn net.Conn, reqID uint64, result []byte) {
-	resp := &v1.Message{
-		Length:    uint32(v1.HeaderSize + len(result)),
+	resp := &protocol.Message{
+		Length:    uint32(protocol.HeaderSize + len(result)),
 		RequestID: reqID,
-		Type:      v1.MessageTypeResponse,
+		Type:      protocol.MessageTypeResponse,
 		Body:      result,
 	}
 	buf := make([]byte, resp.Length)
 	binary.BigEndian.PutUint32(buf[:4], resp.Length)
 	binary.BigEndian.PutUint64(buf[4:12], resp.RequestID)
 	buf[12] = resp.Type
-	copy(buf[v1.HeaderSize:], resp.Body)
+	copy(buf[protocol.HeaderSize:], resp.Body)
 	_, _ = conn.Write(buf)
 }
