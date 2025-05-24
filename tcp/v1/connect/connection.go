@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alynlin/example/tcp/v1/protocol"
@@ -17,10 +19,10 @@ import (
 type Connection struct {
 	conn            net.Conn
 	mu              sync.Mutex
-	pendingRequests map[uint64]*protocol.Future
+	pendingRequests sync.Map // map[uint64]*protocol.Future
 	closeCh         chan struct{}
 	writerCh        chan *protocol.Message
-	closed          bool
+	closed          atomic.Bool
 
 	readBuf  []byte
 	writeBuf []byte
@@ -30,27 +32,23 @@ type Connection struct {
 	onLimit    BufferLimitCallback
 
 	//
-	lastReadTime time.Time     // 最后一次成功接收消息的时间
+	lastReadTime atomic.Value  // 最后一次成功接收消息的时间
 	readTimeout  time.Duration // 最大允许的空闲时间
 }
 
 func (c *Connection) IsClosed() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.closed
+	return c.closed.Load()
 }
 
 func (c *Connection) SendRequest(body []byte, timeout time.Duration) ([]byte, error) {
 	reqID := sequence.GenerateRequestID()
-	future := protocol.NewFuture(timeout)
+	future := protocol.NewFuture(context.Background(), timeout)
 
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
+	if c.IsClosed() {
+		future.Cancel()
 		return nil, errors.New("connection closed")
 	}
-	c.pendingRequests[reqID] = future
-	c.mu.Unlock()
+	c.pendingRequests.Store(reqID, future)
 
 	msg := &protocol.Message{
 		RequestID: reqID,
@@ -62,9 +60,8 @@ func (c *Connection) SendRequest(body []byte, timeout time.Duration) ([]byte, er
 	select {
 	case c.writerCh <- msg:
 	case <-time.After(timeout):
-		c.mu.Lock()
-		delete(c.pendingRequests, reqID)
-		c.mu.Unlock()
+		c.pendingRequests.Delete(reqID)
+		future.Cancel()
 		return nil, errors.New("send timeout")
 	case <-c.closeCh:
 		return nil, errors.New("connection closed")
@@ -73,9 +70,7 @@ func (c *Connection) SendRequest(body []byte, timeout time.Duration) ([]byte, er
 	// 等待响应
 	resp, err := future.Await()
 
-	c.mu.Lock()
-	delete(c.pendingRequests, reqID)
-	c.mu.Unlock()
+	c.pendingRequests.Delete(reqID)
 
 	if err != nil {
 		return nil, err
@@ -105,7 +100,7 @@ func (c *Connection) readLoop() {
 			reqID := binary.BigEndian.Uint64(header[4:12])
 			msgType := header[12]
 			// 检查消息长度是否超出限制
-			if length < 0 || length > uint32(c.maxBufSize) {
+			if length > uint32(c.maxBufSize) {
 				if c.onLimit != nil {
 					c.onLimit(c.addr, "read", int(length))
 				}
@@ -149,62 +144,55 @@ func (c *Connection) readLoop() {
 func (c *Connection) writeLoop() {
 	defer c.Close()
 
-	for {
-		select {
-		case msg := <-c.writerCh:
-			size := protocol.HeaderSize + len(msg.Body)
-			if size > c.maxBufSize {
-				if c.onLimit != nil {
-					c.onLimit(c.addr, "write", size)
-				}
-				continue
+	for msg := range c.writerCh {
+		size := protocol.HeaderSize + len(msg.Body)
+		if size > c.maxBufSize {
+			if c.onLimit != nil {
+				c.onLimit(c.addr, "write", size)
 			}
-			if cap(c.writeBuf) < size {
-				c.writeBuf = make([]byte, size)
-			}
-			buf := c.writeBuf[:size]
+			continue
+		}
+		if cap(c.writeBuf) < size {
+			c.writeBuf = make([]byte, size)
+		}
+		buf := c.writeBuf[:size]
 
-			binary.BigEndian.PutUint32(buf[:4], msg.Length)
-			binary.BigEndian.PutUint64(buf[4:12], msg.RequestID)
-			buf[12] = msg.Type
-			copy(buf[protocol.HeaderSize:], msg.Body)
+		binary.BigEndian.PutUint32(buf[:4], msg.Length)
+		binary.BigEndian.PutUint64(buf[4:12], msg.RequestID)
+		buf[12] = msg.Type
+		copy(buf[protocol.HeaderSize:], msg.Body)
 
-			if _, err := c.conn.Write(buf); err != nil {
-				return
-			}
-		case <-c.closeCh:
+		if _, err := c.conn.Write(buf); err != nil {
 			return
 		}
 	}
 }
 
 func (c *Connection) completeRequest(reqID uint64, msg *protocol.Message) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if future, ok := c.pendingRequests[reqID]; ok {
-		future.Done(msg)
-		delete(c.pendingRequests, reqID)
-		future = nil // 释放内存，避免内存泄漏
+	if v, ok := c.pendingRequests.Load(reqID); ok {
+		if future, ok := v.(*protocol.Future); ok {
+			future.Done(msg)
+			future = nil // 释放内存，避免内存泄漏
+		}
+		c.pendingRequests.Delete(reqID)
 	}
 }
 
 func (c *Connection) Close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
+	if !c.closed.CompareAndSwap(false, true) {
 		return
 	}
-
-	c.closed = true
+	close(c.writerCh)
 	close(c.closeCh)
 	_ = c.conn.Close()
 
-	for reqID, future := range c.pendingRequests {
-		future.Cancel()
-		delete(c.pendingRequests, reqID)
-	}
+	c.pendingRequests.Range(func(key, value any) bool {
+		if f, ok := value.(*protocol.Future); ok {
+			f.Cancel()
+		}
+		c.pendingRequests.Delete(key)
+		return true
+	})
 }
 
 func (c *Connection) startHeartbeat(interval time.Duration) {
@@ -239,10 +227,12 @@ func (c *Connection) startReadTimeoutWatcher(timeout time.Duration) {
 	for {
 		select {
 		case <-ticker.C:
-			idle := time.Since(c.lastReadTime)
-
-			if idle > timeout {
-				// 长时间未收到任何消息，主动关闭连接
+			v := c.lastReadTime.Load()
+			if v == nil {
+				continue
+			}
+			last := v.(time.Time)
+			if time.Since(last) > timeout {
 				fmt.Printf("Connection %s idle for too long, closing", c.addr)
 				c.Close()
 				return
@@ -255,5 +245,5 @@ func (c *Connection) startReadTimeoutWatcher(timeout time.Duration) {
 
 func (c *Connection) updateLastReadTime() {
 	// 如果你希望更严谨可加锁或使用 atomic.Value，但业务上直接赋值是可以接受的
-	c.lastReadTime = time.Now()
+	c.lastReadTime.Store(time.Now())
 }

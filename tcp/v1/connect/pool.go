@@ -65,16 +65,15 @@ func (p *ConnectionPool) newConnection(addr string) (*Connection, error) {
 	}
 
 	c := &Connection{
-		conn:            conn,
-		pendingRequests: make(map[uint64]*protocol.Future),
-		closeCh:         make(chan struct{}),
-		writerCh:        make(chan *protocol.Message, 100),
-		readBuf:         make([]byte, 4096),
-		writeBuf:        make([]byte, 4096),
-		maxBufSize:      p.maxBufferSize,
-		addr:            addr,
-		onLimit:         p.onBufferLimitHit,
-		readTimeout:     p.readTimeout,
+		conn:        conn,
+		closeCh:     make(chan struct{}),
+		writerCh:    make(chan *protocol.Message, 100),
+		readBuf:     make([]byte, 4096),
+		writeBuf:    make([]byte, 4096),
+		maxBufSize:  p.maxBufferSize,
+		addr:        addr,
+		onLimit:     p.onBufferLimitHit,
+		readTimeout: p.readTimeout,
 	}
 
 	go c.readLoop()
