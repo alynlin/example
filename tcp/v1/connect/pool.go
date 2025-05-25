@@ -68,13 +68,15 @@ func (p *ConnectionPool) newConnection(addr string) (*Connection, error) {
 		conn:        conn,
 		closeCh:     make(chan struct{}),
 		writerCh:    make(chan *protocol.Message, 100),
-		readBuf:     make([]byte, 4096),
-		writeBuf:    make([]byte, 4096),
+		headerBuf:   make([]byte, protocol.HeaderSize),
+		bodyBuf:     make([]byte, protocol.DefaultReadBufferSize),
+		writeBuf:    make([]byte, protocol.DefaultWriteBufferSize),
 		maxBufSize:  p.maxBufferSize,
 		addr:        addr,
 		onLimit:     p.onBufferLimitHit,
 		readTimeout: p.readTimeout,
 	}
+	c.lastReadTime.Store(time.Now())
 
 	go c.readLoop()
 	go c.writeLoop()

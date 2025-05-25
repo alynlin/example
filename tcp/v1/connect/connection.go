@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,8 +25,9 @@ type Connection struct {
 	writerCh        chan *protocol.Message
 	closed          atomic.Bool
 
-	readBuf  []byte
-	writeBuf []byte
+	headerBuf []byte // 用于读取 header 的缓冲区
+	bodyBuf   []byte // 用于读取 body 的缓冲区
+	writeBuf  []byte
 
 	maxBufSize int    // 最大缓冲区大小，header + body
 	addr       string // "host:port"
@@ -87,18 +89,17 @@ func (c *Connection) readLoop() {
 			return
 		default:
 			// 保证 readBuf 至少能容纳 Header
-			if len(c.readBuf) < protocol.HeaderSize {
-				c.readBuf = make([]byte, protocol.HeaderSize)
+			if c.headerBuf == nil || len(c.headerBuf) < protocol.HeaderSize {
+				c.headerBuf = make([]byte, protocol.HeaderSize)
 			}
-			header := c.readBuf[:protocol.HeaderSize]
 
-			if _, err := io.ReadFull(c.conn, header); err != nil {
+			if _, err := io.ReadFull(c.conn, c.headerBuf); err != nil {
 				return
 			}
 
-			length := binary.BigEndian.Uint32(header[:4])
-			reqID := binary.BigEndian.Uint64(header[4:12])
-			msgType := header[12]
+			length := binary.BigEndian.Uint32(c.headerBuf[:4])
+			reqID := binary.BigEndian.Uint64(c.headerBuf[4:12])
+			msgType := c.headerBuf[12]
 			// 检查消息长度是否超出限制
 			if length > uint32(c.maxBufSize) {
 				if c.onLimit != nil {
@@ -109,10 +110,10 @@ func (c *Connection) readLoop() {
 
 			// 确保缓冲区容量足够
 			bodyLen := int(length) - protocol.HeaderSize
-			if cap(c.readBuf) < protocol.HeaderSize+bodyLen {
-				c.readBuf = make([]byte, protocol.HeaderSize+bodyLen)
+			if cap(c.bodyBuf) < bodyLen {
+				c.bodyBuf = make([]byte, bodyLen)
 			}
-			body := c.readBuf[protocol.HeaderSize : protocol.HeaderSize+bodyLen]
+			body := c.bodyBuf[:bodyLen] //确保读取的长度是 bodyLen
 
 			if _, err := io.ReadFull(c.conn, body); err != nil {
 				return
@@ -122,7 +123,8 @@ func (c *Connection) readLoop() {
 				Length:    length,
 				RequestID: reqID,
 				Type:      msgType,
-				Body:      append([]byte{}, body...), // 深拷贝避免后续覆盖
+				//下一轮读数据，会污染这条消息的 body 内容
+				Body: slices.Clone(body), // 深拷贝避免后续覆盖
 			}
 
 			switch msgType {
@@ -145,13 +147,14 @@ func (c *Connection) writeLoop() {
 	defer c.Close()
 
 	for msg := range c.writerCh {
-		size := protocol.HeaderSize + len(msg.Body)
+		size := int(msg.Length)
 		if size > c.maxBufSize {
 			if c.onLimit != nil {
 				c.onLimit(c.addr, "write", size)
 			}
 			continue
 		}
+		// 一次性扩容，不回退
 		if cap(c.writeBuf) < size {
 			c.writeBuf = make([]byte, size)
 		}

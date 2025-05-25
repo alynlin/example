@@ -17,6 +17,7 @@ func NewRPCClient() *RPCClient {
 		log.Printf("[WARN] Buffer limit exceeded: addr=%s direction=%s size=%d", addr, direction, size)
 	}
 	return &RPCClient{
+		//64 kb最大缓冲区大小，5 * time.Second 是连接超时时间
 		pool: connect.NewConnectionPool(5*time.Second, 64*1024, logCallback),
 	}
 }
